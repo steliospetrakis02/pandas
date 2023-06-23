@@ -8,7 +8,10 @@ from warnings import catch_warnings
 import numpy as np
 import pytest
 
-from pandas._config import get_option
+from pandas._config import (
+    get_option,
+    using_copy_on_write,
+)
 
 from pandas.compat import is_platform_windows
 from pandas.compat.pyarrow import (
@@ -201,6 +204,8 @@ def check_round_trip(
             with catch_warnings(record=True):
                 actual = read_parquet(path, **read_kwargs)
 
+            if "string_with_nan" in expected:
+                expected.loc[1, "string_with_nan"] = None
             tm.assert_frame_equal(
                 expected,
                 actual,
@@ -428,8 +433,12 @@ class TestBasic(Base):
             df, engine, expected=expected, read_kwargs={"columns": ["string"]}
         )
 
-    def test_write_index(self, engine):
+    def test_write_index(self, engine, using_copy_on_write, request):
         check_names = engine != "fastparquet"
+        if using_copy_on_write and engine == "fastparquet":
+            request.node.add_marker(
+                pytest.mark.xfail(reason="fastparquet write into index")
+            )
 
         df = pd.DataFrame({"A": [1, 2, 3]})
         check_round_trip(df, engine)
@@ -689,6 +698,10 @@ class TestParquetPyArrow(Base):
 
     def test_to_bytes_without_path_or_buf_provided(self, pa, df_full):
         # GH 37105
+        msg = "Mismatched null-like values nan and None found"
+        warn = None
+        if using_copy_on_write():
+            warn = FutureWarning
 
         buf_bytes = df_full.to_parquet(engine=pa)
         assert isinstance(buf_bytes, bytes)
@@ -696,7 +709,10 @@ class TestParquetPyArrow(Base):
         buf_stream = BytesIO(buf_bytes)
         res = read_parquet(buf_stream)
 
-        tm.assert_frame_equal(df_full, res)
+        expected = df_full.copy(deep=False)
+        expected.loc[1, "string_with_nan"] = None
+        with tm.assert_produces_warning(warn, match=msg):
+            tm.assert_frame_equal(df_full, res)
 
     def test_duplicate_columns(self, pa):
         # not currently able to handle duplicate columns
@@ -1201,12 +1217,14 @@ class TestParquetFastParquet(Base):
                 partition_cols=partition_cols,
             )
 
+    @pytest.mark.skipif(using_copy_on_write(), reason="fastparquet writes into Index")
     def test_empty_dataframe(self, fp):
         # GH #27339
         df = pd.DataFrame()
         expected = df.copy()
         check_round_trip(df, fp, expected=expected)
 
+    @pytest.mark.skipif(using_copy_on_write(), reason="fastparquet writes into Index")
     def test_timezone_aware_index(self, fp, timezone_aware_date_list):
         idx = 5 * [timezone_aware_date_list]
 
@@ -1316,6 +1334,7 @@ class TestParquetFastParquet(Base):
             with pytest.raises(ValueError, match=msg):
                 read_parquet(path, dtype_backend="numpy")
 
+    @pytest.mark.skipif(using_copy_on_write(), reason="fastparquet writes into Index")
     def test_empty_columns(self, fp):
         # GH 52034
         df = pd.DataFrame(index=pd.Index(["a", "b", "c"], name="custom name"))
